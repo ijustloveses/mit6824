@@ -10,11 +10,13 @@ package main
 // Please do not change this file.
 //
 
-import "../mr"
-import "plugin"
-import "os"
-import "fmt"
-import "log"
+import (
+	"fmt"
+	"log"
+	"mit6824/mr"
+	"os"
+	"plugin"
+)
 
 func main() {
 	if len(os.Args) != 2 {
@@ -22,9 +24,10 @@ func main() {
 		os.Exit(1)
 	}
 
-	mapf, reducef := loadPlugin(os.Args[1])
+	// mapf, reducef := loadPlugin(os.Args[1])
 
-	mr.Worker(mapf, reducef)
+	// mr.Worker(mapf, reducef)
+	mr.Worker()
 }
 
 //

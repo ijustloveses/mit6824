@@ -3,11 +3,8 @@ package mr
 import (
 	"errors"
 	"fmt"
-	"log"
-	"net"
 	"net/http"
 	"net/rpc"
-	"os"
 	"strconv"
 	"sync"
 	"time"
@@ -26,7 +23,7 @@ func (m *Master) Heartbeat(arg int, reply *int) error {
 	defer m.mu.Unlock()
 
 	if arg == 0 { // 首次连接，返回最大的 id + 1
-		max_id = 0
+		max_id := 0
 		for key := range m.clients {
 			if key > max_id {
 				max_id = key
@@ -63,16 +60,20 @@ func (m *Master) Example(args *ExampleArgs, reply *ExampleReply) error {
 //
 func (m *Master) server() {
 	m.Is_Done = false
+	m.clients = make(map[int]bool)
 	rpc.Register(m)
 	rpc.HandleHTTP()
 	//l, e := net.Listen("tcp", ":1234")
-	sockname := masterSock()
-	os.Remove(sockname)
-	l, e := net.Listen("unix", sockname)
-	if e != nil {
-		log.Fatal("listen error:", e)
-	}
-	go http.Serve(l, nil)
+	/*
+		sockname := masterSock()
+		os.Remove(sockname)
+		l, e := net.Listen("unix", sockname)
+		if e != nil {
+			log.Fatal("listen error:", e)
+		}
+		go http.Serve(l, nil)
+	*/
+	go http.ListenAndServe(":1234", nil)
 
 	go func() {
 		time.Sleep(time.Second * 30)
@@ -91,14 +92,14 @@ func (m *Master) Done() bool {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	num_active = 0
-	for cid, is_active := range m.clients {
+	num_active := 0
+	for _, is_active := range m.clients {
 		if is_active {
 			num_active += 1
 		}
 	}
 	fmt.Println("Active clients: " + strconv.Itoa(num_active))
-	ret = m.is_done
+	ret = m.Is_Done
 
 	return ret
 }

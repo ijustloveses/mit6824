@@ -14,7 +14,7 @@ import (
 	"os"
 	"time"
 
-	"../mr"
+	"mit6824/mr"
 )
 
 func main() {
