@@ -1,18 +1,52 @@
 package mr
 
-import "log"
-import "net"
-import "os"
-import "net/rpc"
-import "net/http"
-
+import (
+	"errors"
+	"fmt"
+	"log"
+	"net"
+	"net/http"
+	"net/rpc"
+	"os"
+	"strconv"
+	"sync"
+	"time"
+)
 
 type Master struct {
 	// Your definitions here.
-
+	Is_Done bool
+	mu      sync.Mutex
+	clients map[int]bool
 }
 
 // Your code here -- RPC handlers for the worker to call.
+func (m *Master) Heartbeat(arg int, reply *int) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if arg == 0 { // 首次连接，返回最大的 id + 1
+		max_id = 0
+		for key := range m.clients {
+			if key > max_id {
+				max_id = key
+			}
+		}
+		*reply = max_id + 1
+		m.clients[max_id+1] = true
+		return nil
+	} else { // 后续连接，传入的 arg 为该 client 的 id，需要保证 id 在 m.clients 中
+		for key := range m.clients {
+			if key == arg {
+				*reply = key
+				m.clients[key] = true
+				return nil
+			}
+		}
+		*reply = arg
+		return errors.New("Failed to match client id")
+	}
+}
 
 //
 // an example RPC handler.
@@ -24,11 +58,11 @@ func (m *Master) Example(args *ExampleArgs, reply *ExampleReply) error {
 	return nil
 }
 
-
 //
 // start a thread that listens for RPCs from worker.go
 //
 func (m *Master) server() {
+	m.Is_Done = false
 	rpc.Register(m)
 	rpc.HandleHTTP()
 	//l, e := net.Listen("tcp", ":1234")
@@ -39,6 +73,11 @@ func (m *Master) server() {
 		log.Fatal("listen error:", e)
 	}
 	go http.Serve(l, nil)
+
+	go func() {
+		time.Sleep(time.Second * 30)
+		m.Is_Done = true
+	}()
 }
 
 //
@@ -49,7 +88,17 @@ func (m *Master) Done() bool {
 	ret := false
 
 	// Your code here.
+	m.mu.Lock()
+	defer m.mu.Unlock()
 
+	num_active = 0
+	for cid, is_active := range m.clients {
+		if is_active {
+			num_active += 1
+		}
+	}
+	fmt.Println("Active clients: " + strconv.Itoa(num_active))
+	ret = m.is_done
 
 	return ret
 }
@@ -63,7 +112,6 @@ func MakeMaster(files []string, nReduce int) *Master {
 	m := Master{}
 
 	// Your code here.
-
 
 	m.server()
 	return &m

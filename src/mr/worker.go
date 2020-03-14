@@ -1,10 +1,12 @@
 package mr
 
-import "fmt"
-import "log"
-import "net/rpc"
-import "hash/fnv"
-
+import (
+	"encoding/json"
+	"fmt"
+	"hash/fnv"
+	"log"
+	"net/rpc"
+)
 
 //
 // Map functions return a slice of KeyValue.
@@ -24,6 +26,35 @@ func ihash(key string) int {
 	return int(h.Sum32() & 0x7fffffff)
 }
 
+//
+// KeyValues -> file
+//
+func saveKVToFile(kvs []KeyValue, file string) error {
+	enc := json.NewEncoder(file)
+	for _, kv := range kvs {
+		err := enc.Encode(&kv)
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+//
+// file -> KeyValues
+//
+func loadKVFromFile(file) ([]KeyValue, error) {
+	kvs = make([]KeyValue)
+	dec := json.NewDecoder(file)
+	for {
+		var kv KeyValue
+		if err := dec.Decode(&kv); err != nil {
+			return kvs, err
+		}
+		kvs = append(kvs, kv)
+	}
+	return kvs, nil
+}
 
 //
 // main/mrworker.go calls this function.
@@ -72,6 +103,7 @@ func call(rpcname string, args interface{}, reply interface{}) bool {
 	c, err := rpc.DialHTTP("unix", sockname)
 	if err != nil {
 		log.Fatal("dialing:", err)
+		return false
 	}
 	defer c.Close()
 
