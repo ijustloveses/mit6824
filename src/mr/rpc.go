@@ -6,8 +6,10 @@ package mr
 // remember to capitalize all names.
 //
 
-import "os"
-import "strconv"
+import (
+	"os"
+	"strconv"
+)
 
 //
 // example to show how to declare the arguments
@@ -23,7 +25,40 @@ type ExampleReply struct {
 }
 
 // Add your RPC definitions here.
+type HeartbeatArgs struct {
+	Cid        string
+	Cur_job    string
+	Cur_status string // idle / ongoing / done；注意，当 master 确认 done 之后，进入 idle 状态
+}
 
+type HeartbeatReply struct {
+	Cid          string
+	Job_assigned string
+}
+
+func validate_heartbeat_args(args *HeartbeatArgs) bool {
+	if args.Cid == "0" {
+		if args.Cur_job == "" && args.Cur_status == "idle" {
+			return true
+		} else {
+			return false
+		}
+	} else {
+		if args.Cur_job == "" {
+			if args.Cur_status == "idle" {
+				return true
+			} else {
+				return false
+			}
+		} else {
+			if args.Cur_status == "ongoing" || args.Cur_status == "done" {
+				return true
+			} else {
+				return false
+			}
+		}
+	}
+}
 
 // Cook up a unique-ish UNIX-domain socket name
 // in /var/tmp, for the master.

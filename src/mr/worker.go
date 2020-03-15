@@ -7,6 +7,7 @@ import (
 	"log"
 	"net/rpc"
 	"os"
+	"sync"
 	"time"
 )
 
@@ -81,17 +82,92 @@ func Worker(mapf func(string, string) []KeyValue,
 }
 */
 
-func Worker() {
-	work_id := 0
+func send_request(cid string, cur_job string, cur_status string, reply *HeartbeatReply) bool {
+	args := HeartbeatArgs{}
+	args.Cid = cid
+	args.Cur_job = cur_job
+	args.Cur_status = cur_status
+	return call("Master.Heartbeat", &args, reply)
+}
 
-	for i := 0; i < 40; i++ {
-		is_ok := call("Master.Heartbeat", work_id, &work_id)
+func do_work(mu *sync.Mutex, cid string, job string, cur_status *string) {
+	fmt.Println(cid + " is running " + job + " ...")
+	time.Sleep(time.Second * 5)
+	fmt.Println(cid + " finish " + job)
+	mu.Lock()
+	*cur_status = "done"
+	mu.Unlock()
+}
+
+func Worker() {
+	cid := "0"
+	cur_job := ""
+	cur_status := "idle"
+	reply := HeartbeatReply{}
+	mu := sync.Mutex{}
+
+	for {
+		mu.Lock()
+		is_ok := send_request(cid, cur_job, cur_status, &reply)
 		if is_ok {
-			fmt.Println("id: ", work_id)
+			if cid == "0" {
+				if reply.Cid == "0" {
+					log.Fatal("Master didn't assign a valid cid")
+					mu.Unlock()
+					break
+				}
+				cid = reply.Cid
+				if reply.Job_assigned != "" {
+					cur_job = reply.Job_assigned
+					cur_status = "ongoing"
+					go do_work(&mu, cid, cur_job, &cur_status)
+				}
+			} else {
+				if cid != reply.Cid {
+					log.Fatal("cid mismatch: " + cid + " v.s. " + reply.Cid)
+					mu.Unlock()
+					break
+				}
+				if cur_status == "done" {
+					if cur_job == "" {
+						log.Fatal("Current job is null when worker status is done")
+						mu.Unlock()
+						break
+					}
+					if reply.Job_assigned != "" {
+						cur_job = reply.Job_assigned
+						cur_status = "ongoing"
+						go do_work(&mu, cid, cur_job, &cur_status)
+					} else {
+						cur_job = ""
+						cur_status = "idle"
+					}
+				} else if cur_status == "idle" {
+					if cur_job != "" {
+						log.Fatal("Current job is not null when worker status is idle")
+						mu.Unlock()
+						break
+					}
+					if reply.Job_assigned != "" {
+						cur_job = reply.Job_assigned
+						cur_status = "ongoing"
+						go do_work(&mu, cid, cur_job, &cur_status)
+					}
+				} else { // ongoing
+					if cur_job != reply.Job_assigned {
+						log.Fatal("Current job not match the job sent to master")
+						mu.Unlock()
+						break
+					}
+				}
+			}
 		} else {
-			fmt.Println("Something is wrong")
+			log.Fatal("Something is wrong")
+			mu.Unlock()
+			time.Sleep(time.Second * 3)
 			break
 		}
+		mu.Unlock()
 		time.Sleep(time.Second)
 	}
 }
