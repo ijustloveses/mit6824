@@ -13,7 +13,7 @@ package main
 import (
 	"fmt"
 	"log"
-	"mit6824/mr"
+	"mit6824/mr" // modified by me here
 	"os"
 	"plugin"
 )
@@ -24,9 +24,9 @@ func main() {
 		os.Exit(1)
 	}
 
-	// mapf, reducef := loadPlugin(os.Args[1])
+	// mapf, reducef := loadPlugin(os.Args[1]) // modified by me here
 
-	// mr.Worker(mapf, reducef)
+	// mr.Worker(mapf, reducef) // modified by me here
 	mr.Worker()
 }
 

@@ -9,11 +9,44 @@ import (
 	"sync"
 )
 
+/* master 逻辑：
+   1. master 维护 worker cid -> job name 和 job name -> status 两个变量，以及一把锁
+   2. 其中 clients 变量维护已连接 workers 正在处理的任务，注意，这里一定是正在处理 ongoing 的任务
+   3. 一旦 worker 的任务已经结束 done，那么就会为其分配新的任务，或者空闲不分配任务
+   4. jobs 变量维护 master 所有任务的状态 (未分配 = waiting ; 正在处理 = ongoing ; 结束 = done)
+   5. clients 和 jobs 两个变量之间的关系和约束见函数 check_inner_status()
+
+   6. Heartbeat 接口接受 worker 的状态，并据此来更新内部变量
+   7. Done 接口用于汇总当前所有连接的 worker 以及所有任务的状态；如果全部任务都完成，返回 true
+   8. 由 6 & 7 ，为这两个接口加锁，保证两个接口按序访问，不会在调用一个接口是被另一个接口更新内部变量
+	  其实， Done 接口是只读接口，貌似不加锁问题也不大，不存在并发写入的情况
+
+	缺陷：目前没有实现以下两个功能
+	- 如果 worker 长期没有发送 heartbeat，从 clients 中去掉，并重启该 worker 正在处理的任务
+	- worker 长期短线后重连时，重新分配 Cid 和任务
+*/
+
 type Master struct {
 	// Your definitions here.
 	mu      sync.Mutex        // for synchronization
 	clients map[string]string // clients' job
 	jobs    map[string]string // job -> waiting / ongoing / done
+}
+
+func check_inner_status(clients map[string]string, jobs map[string]string) error {
+	// 保证 clients 中 worker 正在进行的任务一定在 jobs 中，而且其状态一定是 ongoing
+	for _, job := range clients {
+		if job != nojob {
+			status, matched := jobs[job]
+			if !matched {
+				return errors.New("Job " + job + " not in master.jobs")
+			}
+			if status != "ongoing" {
+				return errors.New("Job " + job + " has status " + status + " instead of ongoing in master.clients")
+			}
+		}
+	}
+	return nil
 }
 
 // Your code here -- RPC handlers for the worker to call.
@@ -23,6 +56,10 @@ func (m *Master) Heartbeat(args *HeartbeatArgs, reply *HeartbeatReply) error {
 
 	if !validate_heartbeat_args(args) {
 		return errors.New("invalid heartbeat args")
+	}
+	err := check_inner_status(m.clients, m.jobs)
+	if err != nil {
+		return err
 	}
 
 	cid := ""
@@ -40,7 +77,7 @@ func (m *Master) Heartbeat(args *HeartbeatArgs, reply *HeartbeatReply) error {
 		}
 		cid = strconv.Itoa(max_id + 1)
 		reply.Cid = cid
-		need_to_assign_job = true
+		need_to_assign_job = true // 等待后面分配任务
 
 	} else { // 后续连接，保证 cid 在 m.clients 中，并根据传入的 job 来更新任务状态
 		job, matched := m.clients[args.Cid]
@@ -52,27 +89,16 @@ func (m *Master) Heartbeat(args *HeartbeatArgs, reply *HeartbeatReply) error {
 				if args.Cur_job != nojob {
 					return errors.New("Job " + args.Cur_job + " in client but not in master")
 				}
-				if args.Cur_status != "idle" {
-					return errors.New("Client " + cid + " should be idle but in " + args.Cur_status)
-				}
-				need_to_assign_job = true
+				need_to_assign_job = true // 等待后面分配任务
 
 			} else {
 				// 确保和客户端的状态一致
 				if args.Cur_job != job {
 					return errors.New("Job " + job + " in master but " + args.Cur_job + " in worker " + cid)
 				}
-				job_status, status_matched := m.jobs[job]
-				if !status_matched {
-					return errors.New("Failed to match job status for " + job + " from master")
-				}
-				// 此时，master 处 job 的状态应该是 ongoing (否则表示未分配 waiting 或者已完成 done)
-				if job_status != "ongoing" {
-					return errors.New("Worker " + cid + " send status " + args.Cur_status + " and master job in " + job_status)
-				}
 				if args.Cur_status == "done" { // 任务完毕，更新任务状态，并重新分配任务
 					m.jobs[job] = "done"
-					need_to_assign_job = true
+					need_to_assign_job = true // 等待后面分配任务
 				} else { // 如果是 ongoing 状态，那么直接返回，所有都保持不变
 					reply.Job_assigned = job
 					return nil
@@ -98,16 +124,6 @@ func (m *Master) Heartbeat(args *HeartbeatArgs, reply *HeartbeatReply) error {
 		return nil
 	}
 	return errors.New("Unexpected way to finish")
-}
-
-//
-// an example RPC handler.
-//
-// the RPC argument and reply types are defined in rpc.go.
-//
-func (m *Master) Example(args *ExampleArgs, reply *ExampleReply) error {
-	reply.Y = args.X + 1
-	return nil
 }
 
 //

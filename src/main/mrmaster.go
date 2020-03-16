@@ -14,7 +14,7 @@ import (
 	"os"
 	"time"
 
-	"mit6824/mr"
+	"mit6824/mr" // modified by me here
 )
 
 func main() {
@@ -28,5 +28,5 @@ func main() {
 		time.Sleep(time.Second)
 	}
 
-	time.Sleep(time.Second)
+	time.Sleep(time.Second * 5) // "* 5" is modified by me here
 }

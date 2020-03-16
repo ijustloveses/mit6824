@@ -11,18 +11,19 @@ import (
 	"strconv"
 )
 
-//
-// example to show how to declare the arguments
-// and reply for an RPC.
-//
+/* worker 参数的逻辑：
+   1. 每个 worker 未连接 master 之前，Cid 为 “0”。连接 master 之后，由 master 分配 Cid
+   2. worker 连接 master 时会汇报当前正在执行的任务名字、该 worker 当前的状态
+   3. worker 没有任务时，Cur_job 为 "<NOJOB>"。不设置为 "" 是为了避免 go rpc 的 bug
+   4. validate_heartbeat_args 函数的目的是保证 Cid / Cur_job / Cur_status 3 个参数设置是合理的
 
-type ExampleArgs struct {
-	X int
-}
-
-type ExampleReply struct {
-	Y int
-}
+   master 参数的逻辑：
+   1. master 会返回 worker 的 Cid，上面说了这个 Cid 最初就是由 master 分配的，之后保持不变
+   2. 还会用 Job_assigned 返回给 worker 分配的任务名字
+	  2a) 如果 worker 是初次连接、之前没有任务、刚刚完成其他任务的情况，会分配新的任务
+	  2b) 如果没有任务分配，那么就设置为 "<NOJOB>"
+	  3c) 如果 worker 任务还在进行中，那么这个参数就保持为正在进行中的任务名字
+*/
 
 // Add your RPC definitions here.
 type HeartbeatArgs struct {
@@ -39,6 +40,7 @@ type HeartbeatReply struct {
 const nojob string = "<NOJOB>"
 
 func validate_heartbeat_args(args *HeartbeatArgs) bool {
+	// 初次连接 master 时，保证 worker 的参数都是初始状态
 	if args.Cid == "0" {
 		if args.Cur_job == nojob && args.Cur_status == "idle" {
 			return true
@@ -46,13 +48,14 @@ func validate_heartbeat_args(args *HeartbeatArgs) bool {
 			return false
 		}
 	} else {
+		// 如果此时 worker 没有任务，那么其状态一定是 idle
 		if args.Cur_job == nojob {
 			if args.Cur_status == "idle" {
 				return true
 			} else {
 				return false
 			}
-		} else {
+		} else { // 否则，如果有工作，那么 worker 的状态一定是 ongoing 或者 done
 			if args.Cur_status == "ongoing" || args.Cur_status == "done" {
 				return true
 			} else {
