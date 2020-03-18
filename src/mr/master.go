@@ -7,35 +7,43 @@ import (
 	"net/rpc"
 	"strconv"
 	"sync"
+	"time"
 )
 
 /* master 逻辑：
-   1. master 维护 worker cid -> job name 和 job name -> status 两个变量，以及一把锁
-   2. 其中 clients 变量维护已连接 workers 正在处理的任务，注意，这里一定是正在处理 ongoing 的任务
+   1. master 维护 worker cid => job 和 job => status 以及 worker cid => status 三个变量，还有一把锁
+   2. 其中 clients (worker cid => job name) 变量维护 workers 正在处理的任务，注意，这里一定是正在处理 ongoing 的任务
    3. 一旦 worker 的任务已经结束 done，那么就会为其分配新的任务，或者空闲不分配任务
    4. jobs 变量维护 master 所有任务的状态 (未分配 = waiting ; 正在处理 = ongoing ; 结束 = done)
-   5. clients 和 jobs 两个变量之间的关系和约束见函数 check_inner_status()
+   5. conns 变量记录每个 worker 连接的状态，会记录上次 heartbeat 的时间，以及当前是否可用；超过 10 秒没有心跳记为不可用
+   6. 断线后，把 worker 的任务重置 waiting 状态，并把该 worker 从 clients 变量中去掉，但不从 conns 中删除（当然也可实现为删除）
+   7. worker 断线重连后，效果和首次连接一样，master 会给它分配新的 cid 和任务，而不会继承之前的 cid
+   8. clients、jobs 和 conns 三个变量之间的关系和约束见函数 check_inner_status()
 
-   6. Heartbeat 接口接受 worker 的状态，并据此来更新内部变量
-   7. Done 接口用于汇总当前所有连接的 worker 以及所有任务的状态；如果全部任务都完成，返回 true
-   8. 由 6 & 7 ，为这两个接口加锁，保证两个接口按序访问，不会在调用一个接口是被另一个接口更新内部变量
-	  其实， Done 接口是只读接口，貌似不加锁问题也不大，不存在并发写入的情况
-
-	缺陷：目前没有实现以下两个功能
-	- 如果 worker 长期没有发送 heartbeat，从 clients 中去掉，并重启该 worker 正在处理的任务
-	- worker 长期短线后重连时，重新分配 Cid 和任务
+   并发逻辑
+   1. Heartbeat 接口接受 worker 的状态，并据此来更新内部变量
+   2. Done 接口用于汇总当前所有连接的 worker 以及所有任务的状态；如果全部任务都完成，返回 true
+   3. check_connections 函数用于检测 workers 的连接状态，处理断线的 workers，也会更新内部变量
+   4. 由以上三点，为这三个接口加锁，保证它们按序访问，不会在调用一个接口时被另一个接口更新内部变量
 */
+
+type WorkerStatus struct {
+	last_heartbeat time.Time
+	is_on          bool
+}
 
 type Master struct {
 	// Your definitions here.
-	mu      sync.Mutex        // for synchronization
-	clients map[string]string // clients' job
-	jobs    map[string]string // job -> waiting / ongoing / done
+	mu      sync.Mutex               // for synchronization
+	clients map[string]string        // worker cid => job
+	jobs    map[string]string        // job -> waiting / ongoing / done
+	conns   map[string]*WorkerStatus // worker cid => status
 }
 
-func check_inner_status(clients map[string]string, jobs map[string]string) error {
-	// 保证 clients 中 worker 正在进行的任务一定在 jobs 中，而且其状态一定是 ongoing
-	for _, job := range clients {
+func check_inner_status(clients map[string]string, jobs map[string]string, conns map[string]*WorkerStatus) error {
+
+	for cid, job := range clients {
+		// 保证 clients 中 worker 正在进行的任务一定在 jobs 中，而且其状态一定是 ongoing
 		if job != nojob {
 			status, matched := jobs[job]
 			if !matched {
@@ -45,6 +53,72 @@ func check_inner_status(clients map[string]string, jobs map[string]string) error
 				return errors.New("Job " + job + " has status " + status + " instead of ongoing in master.clients")
 			}
 		}
+		// 保证 worker 一定在 conns 中维护，并且其连接状态一定是 on
+		ws, matched := conns[cid]
+		if !matched {
+			return errors.New("Worker " + cid + " not in master.conns")
+		}
+		if !ws.is_on {
+			return errors.New("Worker " + cid + " is not available in master.conns")
+		}
+	}
+	return nil
+}
+
+func (m *Master) init() {
+	m.jobs = map[string]string{"foo": "waiting", "bar": "waiting", "zoo": "waiting"}
+	m.clients = make(map[string]string)
+	m.conns = make(map[string]*WorkerStatus)
+}
+
+// workers 连接的维护，目前的实现中，已断线的 worker 仍然被保留在 m.conns 中未被删除
+func (m *Master) check_connections() {
+	m.mu.Lock()
+	m.mu.Unlock()
+
+	now := time.Now()
+	for cid, ws := range m.conns {
+		if ws.is_on { // 只检查那些活跃的 workers，不活跃的会在将来被分配新的 cid
+			diff := now.Sub(ws.last_heartbeat)
+			if diff.Seconds() > 10 {
+				ws.is_on = false
+				job := m.clients[cid]
+				if job != nojob {
+					m.jobs[job] = "waiting" // 重置任务状态
+				}
+				delete(m.clients, cid) // 删除该 worker
+			}
+		}
+	}
+}
+
+func assign_new_cid(conns map[string]*WorkerStatus) string {
+	// 由于 conns 不会删除断线的 worker，故此保留了所有的 cid
+	// 不使用 clients，因为它会删除断线 worker，当删除了 cid 最大的 worker，再分配时会重复分配最大的 cid
+	max_id := 0
+	for key := range conns {
+		clientid, err := strconv.Atoi(key)
+		if err != nil {
+			panic(err)
+		}
+		if clientid > max_id {
+			max_id = clientid
+		}
+	}
+	cid := strconv.Itoa(max_id + 1)
+	return cid
+}
+
+func (m *Master) update_connection(cid string) error {
+	ws, matched := m.conns[cid]
+	if matched { // 之前连接而且当前还活跃的 workers
+		if !ws.is_on {
+			return errors.New("Worker " + cid + " should be active yet not in master.conns")
+		}
+		ws.last_heartbeat = time.Now()
+	} else { // 首次连接或者断线重连的 workers
+		ws = &WorkerStatus{time.Now(), true}
+		m.conns[cid] = ws
 	}
 	return nil
 }
@@ -57,7 +131,7 @@ func (m *Master) Heartbeat(args *HeartbeatArgs, reply *HeartbeatReply) error {
 	if !validate_heartbeat_args(args) {
 		return errors.New("invalid heartbeat args")
 	}
-	err := check_inner_status(m.clients, m.jobs)
+	err := check_inner_status(m.clients, m.jobs, m.conns)
 	if err != nil {
 		return err
 	}
@@ -65,25 +139,23 @@ func (m *Master) Heartbeat(args *HeartbeatArgs, reply *HeartbeatReply) error {
 	cid := ""
 	need_to_assign_job := false
 	if args.Cid == "0" { // 首次连接，返回最大的 id + 1
-		max_id := 0
-		for key := range m.clients {
-			clientid, err := strconv.Atoi(key)
-			if err != nil {
-				panic(err)
-			}
-			if clientid > max_id {
-				max_id = clientid
-			}
-		}
-		cid = strconv.Itoa(max_id + 1)
+		cid = assign_new_cid(m.conns)
 		reply.Cid = cid
 		need_to_assign_job = true // 等待后面分配任务
+		err = m.update_connection(cid)
+		if err != nil {
+			return err
+		}
 
 	} else { // 后续连接，保证 cid 在 m.clients 中，并根据传入的 job 来更新任务状态
-		job, matched := m.clients[args.Cid]
+		job, matched := m.clients[args.Cid] // m.clients 会删除断线的 worker
 		if matched {
 			cid = args.Cid
 			reply.Cid = cid
+			m.update_connection(cid)
+			if err != nil {
+				return err
+			}
 			if job == nojob { // 该客户端尚未分配任务
 				// 确保和客户端的状态一致
 				if args.Cur_job != nojob {
@@ -105,7 +177,18 @@ func (m *Master) Heartbeat(args *HeartbeatArgs, reply *HeartbeatReply) error {
 				}
 			}
 		} else {
-			return errors.New("Failed to match client id")
+			_, matched := m.conns[args.Cid]
+			if matched { // 说明该 worker 断线重连了
+				cid = assign_new_cid(m.conns)
+				reply.Cid = cid
+				need_to_assign_job = true // 等待后面分配任务
+				m.update_connection(cid)
+				if err != nil {
+					return err
+				}
+			} else {
+				return errors.New("Failed to match client id")
+			}
 		}
 	}
 
@@ -154,10 +237,8 @@ func (m *Master) Done() bool {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	num_active_client := len(m.clients)
-	fmt.Println("Active clients: " + strconv.Itoa(num_active_client))
-
 	done := true
+	fmt.Println("\n----------------------")
 	for job, job_status := range m.jobs {
 		fmt.Println(job + ": " + job_status)
 		if job_status != "done" {
@@ -165,11 +246,6 @@ func (m *Master) Done() bool {
 		}
 	}
 	return done
-}
-
-func (m *Master) init() {
-	m.jobs = map[string]string{"foo": "waiting", "bar": "waiting", "zoo": "waiting"}
-	m.clients = make(map[string]string)
 }
 
 //
@@ -182,6 +258,12 @@ func MakeMaster(files []string, nReduce int) *Master {
 
 	// Your code here.
 	m.init()
+	go func() {
+		for {
+			m.check_connections()
+			time.Sleep(time.Second)
+		}
+	}()
 
 	m.server()
 	return &m

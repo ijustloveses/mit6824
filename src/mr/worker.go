@@ -75,10 +75,9 @@ func loadKVFromFile(file string) ([]KeyValue, error) {
    4. 主线程中会通过 Heartbeat 请求的返回值来设置 cid 和 cur_job，并根据当前状态设置 cur_status
    5. 主线程从 master 获取新任务后，会启动新的 goroutine 来运行任务，任务结束后，协程会设置 cur_status
    6. 由 4 & 5，我们需要给主线程的每次处理请求的流程加锁，同时对处理任务协程调整 cur_status 的地方加锁
-
-   缺陷：
-   当无法 dial master 或者 master 对请求的返回有错时，说明网络错误或者程序逻辑错误，那么直接结束 worker
-   以后，在无法 dial master 的情况下，需要加入重连的机制，而不是直接结束
+   7. 当 worker 断线重连时，可能会从 master 获得重新分配的 cid 和任务，需要重新调整 3 个变量的值和状态
+   8. 断线重连后获得了新的任务，此时如果上一任务还在运行，需要有机制结束对应的 go routine
+   9. 当无法 dial master 或者 master 对请求的返回有错时，说明网络错误或者程序逻辑错误，1 秒后重新发送消息
 */
 
 //
