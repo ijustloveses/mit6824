@@ -2,6 +2,7 @@ package mr
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"hash/fnv"
 	"log"
@@ -69,14 +70,15 @@ func loadKVFromFile(file string) ([]KeyValue, error) {
 }
 
 /* worker 逻辑：
-   1. 每个 worker 的主线程运行 Worker() 函数，其中维护 cid / cur_job / cur_status 3 个变量和一把锁
-   2. worker 连接 master 会使用以上三个变量来构造 HeartbeatArgs 实例，汇报它当前的状态和任务
-   3. worker 这 3 个变量之间的约束关系已经由 rpc/validate_heartbeat_args 检验，本文件不再检查
-   4. 主线程中会通过 Heartbeat 请求的返回值来设置 cid 和 cur_job，并根据当前状态设置 cur_status
-   5. 主线程从 master 获取新任务后，会启动新的 goroutine 来运行任务，任务结束后，协程会设置 cur_status
-   6. 由 4 & 5，我们需要给主线程的每次处理请求的流程加锁，同时对处理任务协程调整 cur_status 的地方加锁
-   7. 当 worker 断线重连时，可能会从 master 获得重新分配的 cid 和任务，需要重新调整 3 个变量的值和状态
-   8. 断线重连后获得了新的任务，此时如果上一任务还在运行，需要有机制结束对应的 go routine
+   1. worker 的主线程运行 Worker() 函数，维护 cid / cur_job / cur_status / jobs 4 个变量和一把锁
+      其中，cur_status 是每次 heartbeat 之前由 cid + cur_job +jobs 三个变量的状态推断出来的
+   2. worker 连接 master 会使用前三个变量来构造 HeartbeatArgs 实例，汇报它当前的状态和任务
+   3. worker 前 3 个变量之间的约束关系已经由 rpc/validate_heartbeat_args 检验，本文件不再检查
+   4. 主线程中会通过 Heartbeat 请求的返回值来设置 cid、cur_job 和 jobs
+   5. 主线程从 master 获取新任务后，会启动新的 goroutine 来运行任务，任务结束后，协程会设置 jobs[job] 为 done
+   6. 由 4 & 5，我们需要给主线程的每次处理请求的流程加锁，同时对处理任务协程调整 jobs 的地方加锁
+   7. 当 worker 断线重连时，可能会从 master 获得重新分配的 cid 和任务，需要重新调整 cur_job 来覆盖当前任务
+   8. 断线重连后获得新任务，此时如上一任务协程仍在运行，不会强制停止。由于 cur_job 已经调整，故此运行结果不会被发送给 master
    9. 当无法 dial master 或者 master 对请求的返回有错时，说明网络错误或者程序逻辑错误，1 秒后重新发送消息
 */
 
@@ -94,62 +96,74 @@ func Worker(mapf func(string, string) []KeyValue,
 }
 */
 
+func check_worker_status(cid string, cur_job string, jobs map[string]string) (string, error) {
+	if cur_job == nojob || cid == "0" {
+		return "idle", nil
+	}
+	status, matched := jobs[cur_job]
+	if matched {
+		return status, nil
+	} else {
+		return "", errors.New("Failed to find cur_job in jobs")
+	}
+}
+
 func Worker() {
 	cid := "0"
 	cur_job := nojob
-	cur_status := "idle"
+	jobs := make(map[string]string) // 历史任务状态，状态包括 ongoing, done, ignoring
 	mu := sync.Mutex{}
 
 	for {
-		reply := HeartbeatReply{}
 		mu.Lock()
-		is_ok := send_request(cid, cur_job, cur_status, &reply)
-		if is_ok {
-			if cid == "0" {
-				if reply.Cid == "0" {
-					log.Fatal("Master didn't assign a valid cid")
-					mu.Unlock()
-					break
-				}
-				cid = reply.Cid
-				if reply.Job_assigned != nojob { // 初次连接后被分配任务
-					cur_job = reply.Job_assigned
-					cur_status = "ongoing"
-					go do_work(&mu, cid, cur_job, &cur_status)
-				}
-			} else {
-				if cid != reply.Cid {
-					log.Fatal("cid mismatch: " + cid + " v.s. " + reply.Cid)
-					mu.Unlock()
-					break
-				}
-				if cur_status == "done" {
-					if reply.Job_assigned != nojob { // 任务完成后被分配新任务
+		cur_status, err := check_worker_status(cid, cur_job, jobs)
+		if err != nil {
+			log.Fatal(err)
+		} else {
+			reply := HeartbeatReply{}
+			is_ok := send_request(cid, cur_job, cur_status, &reply)
+			// 如果请求失败，那么什么都不做，也不处理 reply，下一秒重连
+			if is_ok {
+				if cid == "0" {
+					if reply.Cid == "0" {
+						log.Fatal("Master didn't assign a valid cid")
+					} else {
+						cid = reply.Cid
 						cur_job = reply.Job_assigned
-						cur_status = "ongoing"
-						go do_work(&mu, cid, cur_job, &cur_status)
-					} else { // 任务完成后，没有新任务被分配
-						cur_job = nojob
-						cur_status = "idle"
+						if cur_job != nojob { // 初次连接后被分配任务
+							jobs[cur_job] = "ongoing"
+							go do_work(&mu, cid, cur_job, jobs)
+						}
 					}
-				} else if cur_status == "idle" {
-					if reply.Job_assigned != nojob { // 处于 idle 状态的 worker 被分配任务
-						cur_job = reply.Job_assigned
-						cur_status = "ongoing"
-						go do_work(&mu, cid, cur_job, &cur_status)
-					}
-				} else { // ongoing
-					if cur_job != reply.Job_assigned {
-						log.Fatal("Current job not match the job sent to master")
-						mu.Unlock()
-						break
+				} else {
+					if cid != reply.Cid { // 断线重连，获得新的 cid
+						cid = reply.Cid
+						cur_job = reply.Job_assigned // cur_job 被覆盖为新任务，忘掉以前的任务
+						if cur_job != nojob {        // 断线重连后被分配任务
+							jobs[cur_job] = "ongoing"
+							go do_work(&mu, cid, cur_job, jobs)
+						}
+					} else {
+						if cur_status == "done" {
+							cur_job = reply.Job_assigned
+							if cur_job != nojob { // 任务完成后被分配新任务
+								jobs[cur_job] = "ongoing"
+								go do_work(&mu, cid, cur_job, jobs)
+							}
+						} else if cur_status == "idle" {
+							cur_job = reply.Job_assigned
+							if cur_job != nojob { // 处于 idle 状态的 worker 被分配任务
+								jobs[cur_job] = "ongoing"
+								go do_work(&mu, cid, cur_job, jobs)
+							}
+						} else { // ongoing
+							if cur_job != reply.Job_assigned {
+								log.Fatal("Current job not match the job sent to master")
+							}
+						}
 					}
 				}
 			}
-		} else {
-			log.Fatal("Something is wrong")
-			mu.Unlock()
-			break
 		}
 		mu.Unlock()
 		time.Sleep(time.Second)
@@ -190,11 +204,11 @@ func send_request(cid string, cur_job string, cur_status string, reply *Heartbea
 	return ret
 }
 
-func do_work(mu *sync.Mutex, cid string, job string, cur_status *string) {
+func do_work(mu *sync.Mutex, cid string, job string, jobs map[string]string) {
 	fmt.Println(cid + " is running " + job + " ...")
 	time.Sleep(time.Second * 5)
 	fmt.Println(cid + " finish " + job)
 	mu.Lock()
-	*cur_status = "done"
+	jobs[job] = "done"
 	mu.Unlock()
 }
