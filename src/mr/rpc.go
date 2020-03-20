@@ -31,7 +31,7 @@ import (
 type HeartbeatArgs struct {
 	Cid        string // 初始时为 "0"
 	Cur_job    string // 初始时为 "<NOJOB>"，不是 ""，为了避免 go_rpc_bug.go 中的 bug
-	Cur_status string // idle / ongoing / done；注意，当 master 确认 done 之后，进入 idle 状态
+	Cur_status string // idle / ongoing / failed / done；注意，当 master 确认 done 之后，进入 idle 状态
 }
 
 type HeartbeatReply struct {
@@ -39,6 +39,7 @@ type HeartbeatReply struct {
 	Job_assigned string   // 分配的任务 id
 	Job_files    []string // 任务对应的文件列表，对于 map 任务就只有一个文件；reduce 任务可能有多个
 	Phase        string   // map / reduce
+	NReduce      int      // number of reduce
 }
 
 const nojob string = "<NOJOB>"
@@ -59,8 +60,8 @@ func validate_heartbeat_args(args *HeartbeatArgs) bool {
 			} else {
 				return false
 			}
-		} else { // 否则，如果有工作，那么 worker 的状态一定是 ongoing 或者 done
-			if args.Cur_status == "ongoing" || args.Cur_status == "done" {
+		} else { // 否则，如果有工作，那么 worker 的状态一定是 ongoing 、failded 或者 done
+			if args.Cur_status == "ongoing" || args.Cur_status == "done" || args.Cur_status == "failed" {
 				return true
 			} else {
 				return false
@@ -79,8 +80,20 @@ func validate_heartbeat_reply(reply *HeartbeatReply) error {
 	return nil
 }
 
+func name_map_job_name(jobidx int) string {
+	return strconv.Itoa(jobidx)
+}
+
+func name_reduce_job_name(jobidx int) string {
+	return strconv.Itoa(jobidx)
+}
+
 func name_intermediate_file(mapjob string, reducejob string) string {
 	return "mr-" + mapjob + "-" + reducejob
+}
+
+func name_output_file(reducejob string) string {
+	return "mr-out-" + reducejob
 }
 
 // Cook up a unique-ish UNIX-domain socket name

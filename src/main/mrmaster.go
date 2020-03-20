@@ -11,10 +11,10 @@ package main
 
 import (
 	"fmt"
+	"mit6824/mr"
 	"os"
 	"time"
-
-	"mit6824/mr" // modified by me here
+	// modified by me here
 )
 
 func main() {
@@ -28,5 +28,5 @@ func main() {
 		time.Sleep(time.Second)
 	}
 
-	time.Sleep(time.Second * 5) // "* 5" is modified by me here
+	time.Sleep(time.Second)
 }

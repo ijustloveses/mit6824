@@ -5,13 +5,18 @@ import (
 	"errors"
 	"fmt"
 	"hash/fnv"
+	"io"
+	"io/ioutil"
 	"log"
 	"net/rpc"
 	"os"
+	"sort"
 	"strconv"
 	"sync"
 	"time"
 )
+
+/* Part I. Map & Reduce handle logic here，主要参见 mrsequential.go & lab 信息 */
 
 //
 // Map functions return a slice of KeyValue.
@@ -20,6 +25,14 @@ type KeyValue struct {
 	Key   string
 	Value string
 }
+
+// for sorting by key.
+type ByKey []KeyValue
+
+// for sorting by key.
+func (a ByKey) Len() int           { return len(a) }
+func (a ByKey) Swap(i, j int)      { a[i], a[j] = a[j], a[i] }
+func (a ByKey) Less(i, j int) bool { return a[i].Key < a[j].Key }
 
 //
 // use ihash(key) % NReduce to choose the reduce
@@ -35,19 +48,21 @@ func ihash(key string) int {
 // KeyValues -> file
 //
 func saveKVToFile(kvs []KeyValue, file string) error {
-	fp, err := os.Open(file)
-	defer fp.Close()
+	fp, err := ioutil.TempFile(".", "kvdump")
+	// fp, err := os.Open(file)
 	if err != nil {
-		panic(err)
+		return err
 	}
 	enc := json.NewEncoder(fp)
 	for _, kv := range kvs {
 		err := enc.Encode(&kv)
 		if err != nil {
+			fp.Close()
 			return err
 		}
 	}
-	return nil
+	fp.Close()
+	return os.Rename(fp.Name(), file)
 }
 
 //
@@ -57,20 +72,108 @@ func loadKVFromFile(file string) ([]KeyValue, error) {
 	fp, err := os.Open(file)
 	defer fp.Close()
 	if err != nil {
-		panic(err)
+		return []KeyValue{}, err
 	}
 	kvs := []KeyValue{}
 	dec := json.NewDecoder(fp)
 	for {
 		var kv KeyValue
 		if err := dec.Decode(&kv); err != nil {
-			return kvs, err
+			if err == io.EOF {
+				return kvs, nil
+			} else {
+				return kvs, err
+			}
 		}
 		kvs = append(kvs, kv)
 	}
 }
 
-/* worker 逻辑：
+func do_map(mapf func(string, string) []KeyValue, file string, job string, nReduce int) error {
+	fp, err := os.Open(file)
+	if err != nil {
+		return err
+	}
+	content, err := ioutil.ReadAll(fp)
+	if err != nil {
+		return err
+	}
+	fp.Close()
+
+	// 运行 map 任务，生成 kv 列表
+	kvs := mapf(file, string(content))
+
+	// 按 nReduce 分组
+	kvmap := make(map[string][]KeyValue)
+	for _, kv := range kvs {
+		rj := name_reduce_job_name(ihash(kv.Key) % nReduce)
+		kvmap[rj] = append(kvmap[rj], kv)
+	}
+
+	// 每组 kv 列表分别写入文件
+	for rj, kvslice := range kvmap {
+		outfile := name_intermediate_file(job, rj)
+		err := saveKVToFile(kvslice, outfile)
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func fileExists(filename string) bool {
+	info, err := os.Stat(filename)
+	if os.IsNotExist(err) {
+		return false
+	}
+	return !info.IsDir()
+}
+
+func do_reduce(reducef func(string, []string) string, files []string, job string) error {
+	// 首先，从所有文件中读取出 kvs，并合在一起
+	// 注意，文件名是由 master 预先指定的，但是某些 map 任务可能不会生成对应该 reduce job 对应文件
+	allkvs := []KeyValue{}
+	for _, file := range files {
+		if fileExists(file) { // 只有文件存在才去收集，否则说明 map 未生成该文件
+			kvs, err := loadKVFromFile(file)
+			if err != nil {
+				return err
+			}
+			allkvs = append(allkvs, kvs...)
+		}
+	}
+
+	// 对 allkvs 进行排序，参见 mrsequential.go
+	sort.Sort(ByKey(allkvs))
+
+	// 按不同的 key 值整理到一起，调用 reducef，并写入结果文件，同样参见 mrsequential.go
+	outfilename := name_output_file(job)
+	fp, err := ioutil.TempFile(".", "tmpout")
+	if err != nil {
+		return err
+	}
+	tmpfilename := fp.Name()
+
+	i := 0
+	for i < len(allkvs) {
+		j := i + 1
+		for j < len(allkvs) && allkvs[j].Key == allkvs[i].Key {
+			j++
+		}
+		values := []string{}
+		for k := i; k < j; k++ {
+			values = append(values, allkvs[k].Value)
+		}
+		output := reducef(allkvs[i].Key, values)
+		fmt.Fprintf(fp, "%v %v\n", allkvs[i].Key, output)
+		i = j
+	}
+
+	fp.Close()
+	return os.Rename(tmpfilename, outfilename)
+}
+
+/* Part II. worker 逻辑：
    1. worker 的主线程运行 Worker() 函数，维护 cid / cur_job / cur_status / cur_phase / jobs 5 个变量和一把锁
 	  其中，cur_status 是每次 heartbeat 之前由 cid + cur_job +jobs 三个变量的状态推断出来的
 	       cur_phase 表示当前处于 map 还是 reduce 阶段
@@ -86,20 +189,6 @@ func loadKVFromFile(file string) ([]KeyValue, error) {
    10. 总体来说，worker 部分的实现“几乎”是无状态的，严格执行 master 传入的任务
 */
 
-//
-// main/mrworker.go calls this function.
-/*
-func Worker(mapf func(string, string) []KeyValue,
-	reducef func(string, []string) string) {
-
-	// Your worker implementation here.
-
-	// uncomment to send the Example RPC to the master.
-	// CallExample()
-
-}
-*/
-
 func check_worker_status(cid string, cur_job string, jobs map[string]string) (string, error) {
 	if cur_job == nojob || cid == "0" {
 		return "idle", nil
@@ -112,7 +201,10 @@ func check_worker_status(cid string, cur_job string, jobs map[string]string) (st
 	}
 }
 
-func Worker() {
+//
+// main/mrworker.go calls this function.
+//
+func Worker(mapf func(string, string) []KeyValue, reducef func(string, []string) string) {
 	cid := "0"
 	cur_job := nojob
 	jobs := make(map[string]string) // 历史任务状态，状态包括 ongoing, done, ignoring
@@ -137,7 +229,7 @@ func Worker() {
 						cur_job = reply.Job_assigned
 						if cur_job != nojob { // 初次连接后被分配任务
 							jobs[cur_job] = "ongoing"
-							go do_work(&mu, cid, cur_job, jobs, reply.Job_files, reply.Phase)
+							go do_work(&mu, cid, cur_job, jobs, &reply, mapf, reducef)
 						}
 					} else {
 						if cid != reply.Cid { // 断线重连，获得新的 cid
@@ -147,7 +239,7 @@ func Worker() {
 								cur_job = reply.Job_assigned // 否则，cur_job 被覆盖为新任务，忘掉以前的任务
 								if cur_job != nojob {        // 断线重连后被分配任务
 									jobs[cur_job] = "ongoing"
-									go do_work(&mu, cid, cur_job, jobs, reply.Job_files, reply.Phase)
+									go do_work(&mu, cid, cur_job, jobs, &reply, mapf, reducef)
 								}
 							}
 						} else {
@@ -155,13 +247,19 @@ func Worker() {
 								cur_job = reply.Job_assigned
 								if cur_job != nojob { // 任务完成后被分配新任务
 									jobs[cur_job] = "ongoing"
-									go do_work(&mu, cid, cur_job, jobs, reply.Job_files, reply.Phase)
+									go do_work(&mu, cid, cur_job, jobs, &reply, mapf, reducef)
+								}
+							} else if cur_status == "failed" {
+								cur_job = reply.Job_assigned
+								if cur_job != nojob { // 任务失败后被分配新任务
+									jobs[cur_job] = "ongoing"
+									go do_work(&mu, cid, cur_job, jobs, &reply, mapf, reducef)
 								}
 							} else if cur_status == "idle" {
 								cur_job = reply.Job_assigned
 								if cur_job != nojob { // 处于 idle 状态的 worker 被分配任务
 									jobs[cur_job] = "ongoing"
-									go do_work(&mu, cid, cur_job, jobs, reply.Job_files, reply.Phase)
+									go do_work(&mu, cid, cur_job, jobs, &reply, mapf, reducef)
 								}
 							} else { // ongoing
 								if cur_job != reply.Job_assigned {
@@ -212,11 +310,35 @@ func send_request(cid string, cur_job string, cur_status string, reply *Heartbea
 	return ret
 }
 
-func do_work(mu *sync.Mutex, cid string, job string, jobs map[string]string, job_files []string, phase string) {
-	fmt.Println("[" + phase + "]: " + cid + " is running " + job + " with " + strconv.Itoa(len(job_files)) + " files ...")
-	time.Sleep(time.Second * 5)
-	fmt.Println(cid + " finish " + job)
-	mu.Lock()
-	jobs[job] = "done"
-	mu.Unlock()
+func do_work(mu *sync.Mutex, cid string, job string, jobs map[string]string, reply *HeartbeatReply, mapf func(string, string) []KeyValue, reducef func(string, []string) string) {
+	fmt.Println("[" + reply.Phase + "]: " + cid + " is running " + job + " with " + strconv.Itoa(len(reply.Job_files)) + " files ...")
+	if reply.Phase == "map" {
+		err := do_map(mapf, reply.Job_files[0], job, reply.NReduce)
+		if err != nil {
+			fmt.Println(cid + " map FAILED " + job)
+			fmt.Println(err)
+			mu.Lock()
+			jobs[job] = "failed" // 返回错误状态
+			mu.Unlock()
+		} else {
+			fmt.Println(cid + " map FINISH " + job)
+			mu.Lock()
+			jobs[job] = "done" // 返会成功状态
+			mu.Unlock()
+		}
+	} else {
+		err := do_reduce(reducef, reply.Job_files, job)
+		if err != nil {
+			fmt.Println(cid + " reduce FAILED " + job)
+			fmt.Println(err)
+			mu.Lock()
+			jobs[job] = "failed" // 返回错误状态
+			mu.Unlock()
+		} else {
+			fmt.Println(cid + " reduce FINISH " + job)
+			mu.Lock()
+			jobs[job] = "done" // 返会成功状态
+			mu.Unlock()
+		}
+	}
 }

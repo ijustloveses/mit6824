@@ -76,25 +76,24 @@ func check_inner_status(clients map[string]string, jobs map[string]string, conns
 func (m *Master) init_jobs(files []string, nReduce int) {
 	/* 通过 map 阶段的文件名以及 reduce 的个数，初始化所有任务相关的变量 */
 	for i, f := range files {
-		mj := "m" + strconv.Itoa(i+1)
+		mj := name_map_job_name(i)
 		m.jobs[mj] = "waiting"           // map job waiting
 		m.map_jobfiles[mj] = []string{f} // map job 对应的文件参数只有本文件一个
 
-		for j := 1; j <= nReduce; j++ { // 每个 reduce job 添加该文件对应的 map 阶段生成的中间文件
-			rj := "r" + strconv.Itoa(j)
+		for j := 0; j < nReduce; j++ { // 每个 reduce job 添加该文件对应的 map 阶段生成的中间文件
+			rj := name_reduce_job_name(j)
 			m.reduce_jobfiles[rj] = append(m.reduce_jobfiles[rj], name_intermediate_file(mj, rj))
 		}
 	}
 
-	for j := 1; j <= nReduce; j++ {
-		rj := "r" + strconv.Itoa(j)
+	for j := 0; j < nReduce; j++ {
+		rj := name_reduce_job_name(j)
 		m.temp_reduce_jobs[rj] = "waiting" // nReduce 个 reduce jobs，都 waiting
 	}
 }
 
-func (m *Master) init(nReduce int) {
+func (m *Master) init(files []string, nReduce int) {
 	m.phase = "map"
-	files := []string{"foo", "bar", "zoo"}
 	m.clients = make(map[string]string)
 	m.conns = make(map[string]*WorkerStatus)
 	m.jobs = make(map[string]string)
@@ -188,7 +187,8 @@ func (m *Master) Heartbeat(args *HeartbeatArgs, reply *HeartbeatReply) error {
 	cid := ""
 	need_to_assign_job := false
 	reply.Phase = m.phase
-	if args.Cid == "0" { // 首次连接，返回最大的 id + 1
+	reply.NReduce = len(m.reduce_jobfiles) // nReduce
+	if args.Cid == "0" {                   // 首次连接，返回最大的 id + 1
 		cid = assign_new_cid(m.conns)
 		reply.Cid = cid
 		need_to_assign_job = true // 等待后面分配任务
@@ -221,6 +221,9 @@ func (m *Master) Heartbeat(args *HeartbeatArgs, reply *HeartbeatReply) error {
 				if args.Cur_status == "done" { // 任务完毕，更新任务状态，并重新分配任务
 					m.jobs[job] = "done"
 					need_to_assign_job = true // 等待后面分配任务
+				} else if args.Cur_status == "failed" {
+					m.jobs[job] = "waiting"   // 任务失败后，重置为 "waiting" 重新分配
+					need_to_assign_job = true // 任务失败后重新分配新任务
 				} else { // 如果是 ongoing 状态，那么直接返回，所有都保持不变
 					reply.Job_assigned = job
 					return nil
@@ -312,7 +315,7 @@ func MakeMaster(files []string, nReduce int) *Master {
 	m := Master{}
 
 	// Your code here.
-	m.init(nReduce)
+	m.init(files, nReduce)
 	go func() {
 		for {
 			m.check_status()
