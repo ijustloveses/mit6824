@@ -122,7 +122,7 @@ func Worker() {
 		mu.Lock()
 		cur_status, err := check_worker_status(cid, cur_job, jobs)
 		if err != nil {
-			log.Fatal(err)
+			log.Println(err)
 		} else {
 			reply := HeartbeatReply{}
 			is_ok := send_request(cid, cur_job, cur_status, &reply)
@@ -130,7 +130,7 @@ func Worker() {
 			if is_ok {
 				err = validate_heartbeat_reply(&reply) // 检查 reply 的合理性
 				if err != nil {
-					log.Fatal(err)
+					log.Println(err)
 				} else {
 					if cid == "0" {
 						cid = reply.Cid
@@ -165,7 +165,7 @@ func Worker() {
 								}
 							} else { // ongoing
 								if cur_job != reply.Job_assigned {
-									log.Fatal("Current job not match the job sent to master")
+									log.Println("Current job not match the job sent to master")
 								}
 							}
 						}
@@ -188,7 +188,7 @@ func call(rpcname string, args interface{}, reply interface{}) bool {
 	// sockname := masterSock()
 	// c, err := rpc.DialHTTP("unix", sockname)
 	if err != nil {
-		log.Fatal("dialing:", err)
+		log.Println("dialing:", err)
 		return false
 	}
 	defer c.Close()
