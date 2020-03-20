@@ -8,6 +8,7 @@ import (
 	"log"
 	"net/rpc"
 	"os"
+	"strconv"
 	"sync"
 	"time"
 )
@@ -70,16 +71,19 @@ func loadKVFromFile(file string) ([]KeyValue, error) {
 }
 
 /* worker 逻辑：
-   1. worker 的主线程运行 Worker() 函数，维护 cid / cur_job / cur_status / jobs 4 个变量和一把锁
-      其中，cur_status 是每次 heartbeat 之前由 cid + cur_job +jobs 三个变量的状态推断出来的
+   1. worker 的主线程运行 Worker() 函数，维护 cid / cur_job / cur_status / cur_phase / jobs 5 个变量和一把锁
+	  其中，cur_status 是每次 heartbeat 之前由 cid + cur_job +jobs 三个变量的状态推断出来的
+	       cur_phase 表示当前处于 map 还是 reduce 阶段
    2. worker 连接 master 会使用前三个变量来构造 HeartbeatArgs 实例，汇报它当前的状态和任务
+      不需要传递 cur_phase 变量，是因为本实现下，这个变量其实是由 master 掌控并传递给 workers 的
    3. worker 前 3 个变量之间的约束关系已经由 rpc/validate_heartbeat_args 检验，本文件不再检查
-   4. 主线程中会通过 Heartbeat 请求的返回值来设置 cid、cur_job 和 jobs
+   4. 主线程中会通过 Heartbeat 请求的返回值来设置 cid、cur_job 和 jobs，当然还有任务的文件参数
    5. 主线程从 master 获取新任务后，会启动新的 goroutine 来运行任务，任务结束后，协程会设置 jobs[job] 为 done
    6. 由 4 & 5，我们需要给主线程的每次处理请求的流程加锁，同时对处理任务协程调整 jobs 的地方加锁
    7. 当 worker 断线重连时，可能会从 master 获得重新分配的 cid 和任务，需要重新调整 cur_job 来覆盖当前任务
    8. 断线重连后获得新任务，此时如上一任务协程仍在运行，不会强制停止。由于 cur_job 已经调整，故此运行结果不会被发送给 master
    9. 当无法 dial master 或者 master 对请求的返回有错时，说明网络错误或者程序逻辑错误，1 秒后重新发送消息
+   10. 总体来说，worker 部分的实现“几乎”是无状态的，严格执行 master 传入的任务
 */
 
 //
@@ -124,41 +128,45 @@ func Worker() {
 			is_ok := send_request(cid, cur_job, cur_status, &reply)
 			// 如果请求失败，那么什么都不做，也不处理 reply，下一秒重连
 			if is_ok {
-				if cid == "0" {
-					if reply.Cid == "0" {
-						log.Fatal("Master didn't assign a valid cid")
-					} else {
+				err = validate_heartbeat_reply(&reply) // 检查 reply 的合理性
+				if err != nil {
+					log.Fatal(err)
+				} else {
+					if cid == "0" {
 						cid = reply.Cid
 						cur_job = reply.Job_assigned
 						if cur_job != nojob { // 初次连接后被分配任务
 							jobs[cur_job] = "ongoing"
-							go do_work(&mu, cid, cur_job, jobs)
-						}
-					}
-				} else {
-					if cid != reply.Cid { // 断线重连，获得新的 cid
-						cid = reply.Cid
-						cur_job = reply.Job_assigned // cur_job 被覆盖为新任务，忘掉以前的任务
-						if cur_job != nojob {        // 断线重连后被分配任务
-							jobs[cur_job] = "ongoing"
-							go do_work(&mu, cid, cur_job, jobs)
+							go do_work(&mu, cid, cur_job, jobs, reply.Job_files, reply.Phase)
 						}
 					} else {
-						if cur_status == "done" {
-							cur_job = reply.Job_assigned
-							if cur_job != nojob { // 任务完成后被分配新任务
-								jobs[cur_job] = "ongoing"
-								go do_work(&mu, cid, cur_job, jobs)
+						if cid != reply.Cid { // 断线重连，获得新的 cid
+							cid = reply.Cid
+							// 如果分配的任务恰好和之前的任务一致，也就是说断线前的任务，那么什么也不做
+							if reply.Job_assigned != cur_job {
+								cur_job = reply.Job_assigned // 否则，cur_job 被覆盖为新任务，忘掉以前的任务
+								if cur_job != nojob {        // 断线重连后被分配任务
+									jobs[cur_job] = "ongoing"
+									go do_work(&mu, cid, cur_job, jobs, reply.Job_files, reply.Phase)
+								}
 							}
-						} else if cur_status == "idle" {
-							cur_job = reply.Job_assigned
-							if cur_job != nojob { // 处于 idle 状态的 worker 被分配任务
-								jobs[cur_job] = "ongoing"
-								go do_work(&mu, cid, cur_job, jobs)
-							}
-						} else { // ongoing
-							if cur_job != reply.Job_assigned {
-								log.Fatal("Current job not match the job sent to master")
+						} else {
+							if cur_status == "done" {
+								cur_job = reply.Job_assigned
+								if cur_job != nojob { // 任务完成后被分配新任务
+									jobs[cur_job] = "ongoing"
+									go do_work(&mu, cid, cur_job, jobs, reply.Job_files, reply.Phase)
+								}
+							} else if cur_status == "idle" {
+								cur_job = reply.Job_assigned
+								if cur_job != nojob { // 处于 idle 状态的 worker 被分配任务
+									jobs[cur_job] = "ongoing"
+									go do_work(&mu, cid, cur_job, jobs, reply.Job_files, reply.Phase)
+								}
+							} else { // ongoing
+								if cur_job != reply.Job_assigned {
+									log.Fatal("Current job not match the job sent to master")
+								}
 							}
 						}
 					}
@@ -204,8 +212,8 @@ func send_request(cid string, cur_job string, cur_status string, reply *Heartbea
 	return ret
 }
 
-func do_work(mu *sync.Mutex, cid string, job string, jobs map[string]string) {
-	fmt.Println(cid + " is running " + job + " ...")
+func do_work(mu *sync.Mutex, cid string, job string, jobs map[string]string, job_files []string, phase string) {
+	fmt.Println("[" + phase + "]: " + cid + " is running " + job + " with " + strconv.Itoa(len(job_files)) + " files ...")
 	time.Sleep(time.Second * 5)
 	fmt.Println(cid + " finish " + job)
 	mu.Lock()

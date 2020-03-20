@@ -11,7 +11,9 @@ import (
 )
 
 /* master 逻辑：
-   1. master 维护 worker cid => job 和 job => status 以及 worker cid => status 三个变量，还有一把锁
+   1. master 维护 worker cid => job 和 job => status 以及 worker cid => status 和 phase 四个变量，还有一把锁
+	  其实还有 temp_reduce_jobs 变量，不过这个变量只是用于临时保存 reduce 阶段的 jobs，在 reduce 阶段开始时会赋给 jobs 变量
+	  以及 map_jobfiles & reduce_jobfiles 两个变量保存两个阶段任务各自对应的文件列表
    2. 其中 clients (worker cid => job name) 变量维护 workers 正在处理的任务，注意，这里一定是正在处理 ongoing 的任务
    3. 一旦 worker 的任务已经结束 done，那么就会为其分配新的任务，或者空闲不分配任务
    4. jobs 变量维护 master 所有任务的状态 (未分配 = waiting ; 正在处理 = ongoing ; 结束 = done)
@@ -19,11 +21,13 @@ import (
    6. 断线后，把 worker 的任务重置 waiting 状态，并把该 worker 从 clients 变量中去掉，但不从 conns 中删除（当然也可实现为删除）
    7. worker 断线重连后，效果和首次连接一样，master 会给它分配新的 cid 和任务，而不会继承之前的 cid
    8. clients、jobs 和 conns 三个变量之间的关系和约束见函数 check_inner_status()
+   9. 由于本程序在本机运行，中间文件的保存位置都已知，故此不需要记录哪个任务由哪个 worker 完成（中间文件保存在该 worker 上）
 
    并发逻辑
    1. Heartbeat 接口接受 worker 的状态，并据此来更新内部变量
    2. Done 接口用于汇总当前所有连接的 worker 以及所有任务的状态；如果全部任务都完成，返回 true
-   3. check_connections 函数用于检测 workers 的连接状态，处理断线的 workers，也会更新内部变量
+   3. check_status 函数用于 a) 检测 workers 的连接状态，处理断线的 workers，也会更新内部变量
+                           b) 检测当前是 map 还是 reduce 阶段
    4. 由以上三点，为这三个接口加锁，保证它们按序访问，不会在调用一个接口时被另一个接口更新内部变量
 */
 
@@ -34,14 +38,18 @@ type WorkerStatus struct {
 
 type Master struct {
 	// Your definitions here.
-	mu      sync.Mutex               // for synchronization
-	clients map[string]string        // worker cid => job
-	jobs    map[string]string        // job -> waiting / ongoing / done
-	conns   map[string]*WorkerStatus // worker cid => status
+	mu               sync.Mutex               // for synchronization
+	phase            string                   // map / reduce
+	clients          map[string]string        // worker cid => job
+	jobs             map[string]string        // job -> waiting / ongoing / done
+	conns            map[string]*WorkerStatus // worker cid => status
+	temp_reduce_jobs map[string]string        // temporarily save reduce jobs
+	map_jobfiles     map[string][]string      // job files in map phase
+	reduce_jobfiles  map[string][]string      // job file in reduce phase
 }
 
 func check_inner_status(clients map[string]string, jobs map[string]string, conns map[string]*WorkerStatus) error {
-
+	/* 检查 clients / jobs / conns 三个变量之间的关系都是正常的 */
 	for cid, job := range clients {
 		// 保证 clients 中 worker 正在进行的任务一定在 jobs 中，而且其状态一定是 ongoing
 		if job != nojob {
@@ -65,14 +73,40 @@ func check_inner_status(clients map[string]string, jobs map[string]string, conns
 	return nil
 }
 
-func (m *Master) init() {
-	m.jobs = map[string]string{"foo": "waiting", "bar": "waiting", "zoo": "waiting"}
+func (m *Master) init_jobs(files []string, nReduce int) {
+	/* 通过 map 阶段的文件名以及 reduce 的个数，初始化所有任务相关的变量 */
+	for i, f := range files {
+		mj := "m" + strconv.Itoa(i+1)
+		m.jobs[mj] = "waiting"           // map job waiting
+		m.map_jobfiles[mj] = []string{f} // map job 对应的文件参数只有本文件一个
+
+		for j := 1; j <= nReduce; j++ { // 每个 reduce job 添加该文件对应的 map 阶段生成的中间文件
+			rj := "r" + strconv.Itoa(j)
+			m.reduce_jobfiles[rj] = append(m.reduce_jobfiles[rj], name_intermediate_file(mj, rj))
+		}
+	}
+
+	for j := 1; j <= nReduce; j++ {
+		rj := "r" + strconv.Itoa(j)
+		m.temp_reduce_jobs[rj] = "waiting" // nReduce 个 reduce jobs，都 waiting
+	}
+}
+
+func (m *Master) init(nReduce int) {
+	m.phase = "map"
+	files := []string{"foo", "bar", "zoo"}
 	m.clients = make(map[string]string)
 	m.conns = make(map[string]*WorkerStatus)
+	m.jobs = make(map[string]string)
+	m.temp_reduce_jobs = make(map[string]string)
+	m.map_jobfiles = make(map[string][]string)
+	m.reduce_jobfiles = make(map[string][]string)
+	m.init_jobs(files, nReduce)
 }
 
 // workers 连接的维护，目前的实现中，已断线的 worker 仍然被保留在 m.conns 中未被删除
-func (m *Master) check_connections() {
+// 该函数还会检查当前的运行阶段，如果 map 完毕，那么切换到 reduce 阶段
+func (m *Master) check_status() {
 	m.mu.Lock()
 	m.mu.Unlock()
 
@@ -88,6 +122,20 @@ func (m *Master) check_connections() {
 				}
 				delete(m.clients, cid) // 删除该 worker
 			}
+		}
+	}
+
+	if m.phase == "map" { // 检查是否 map 阶段已经完毕
+		map_done := true
+		for _, status := range m.jobs {
+			if status != "done" {
+				map_done = false
+				break
+			}
+		}
+		if map_done { // 进入 reduce 阶段
+			m.jobs = m.temp_reduce_jobs
+			m.phase = "reduce"
 		}
 	}
 }
@@ -110,13 +158,14 @@ func assign_new_cid(conns map[string]*WorkerStatus) string {
 }
 
 func (m *Master) update_connection(cid string) error {
+	/* 之前连接过但是掉线了的非活跃 workers 的原 cid 不会也不应该在此函数中被传入 */
 	ws, matched := m.conns[cid]
 	if matched { // 之前连接而且当前还活跃的 workers
 		if !ws.is_on {
 			return errors.New("Worker " + cid + " should be active yet not in master.conns")
 		}
 		ws.last_heartbeat = time.Now()
-	} else { // 首次连接或者断线重连的 workers
+	} else { // 首次连接或者断线重连的 workers，此时被分配了新的 cid
 		ws = &WorkerStatus{time.Now(), true}
 		m.conns[cid] = ws
 	}
@@ -138,6 +187,7 @@ func (m *Master) Heartbeat(args *HeartbeatArgs, reply *HeartbeatReply) error {
 
 	cid := ""
 	need_to_assign_job := false
+	reply.Phase = m.phase
 	if args.Cid == "0" { // 首次连接，返回最大的 id + 1
 		cid = assign_new_cid(m.conns)
 		reply.Cid = cid
@@ -152,7 +202,7 @@ func (m *Master) Heartbeat(args *HeartbeatArgs, reply *HeartbeatReply) error {
 		if matched {
 			cid = args.Cid
 			reply.Cid = cid
-			m.update_connection(cid)
+			err = m.update_connection(cid)
 			if err != nil {
 				return err
 			}
@@ -182,7 +232,7 @@ func (m *Master) Heartbeat(args *HeartbeatArgs, reply *HeartbeatReply) error {
 				cid = assign_new_cid(m.conns)
 				reply.Cid = cid
 				need_to_assign_job = true // 等待后面分配任务
-				m.update_connection(cid)
+				err = m.update_connection(cid)
 				if err != nil {
 					return err
 				}
@@ -199,6 +249,11 @@ func (m *Master) Heartbeat(args *HeartbeatArgs, reply *HeartbeatReply) error {
 		for job, status := range m.jobs {
 			if status == "waiting" {
 				reply.Job_assigned = job
+				if m.phase == "map" {
+					reply.Job_files = m.map_jobfiles[job]
+				} else {
+					reply.Job_files = m.reduce_jobfiles[job]
+				}
 				m.jobs[job] = "ongoing"
 				m.clients[cid] = job
 				break
@@ -245,7 +300,7 @@ func (m *Master) Done() bool {
 			done = false
 		}
 	}
-	return done
+	return done && m.phase == "reduce"
 }
 
 //
@@ -257,10 +312,10 @@ func MakeMaster(files []string, nReduce int) *Master {
 	m := Master{}
 
 	// Your code here.
-	m.init()
+	m.init(nReduce)
 	go func() {
 		for {
-			m.check_connections()
+			m.check_status()
 			time.Sleep(time.Second)
 		}
 	}()

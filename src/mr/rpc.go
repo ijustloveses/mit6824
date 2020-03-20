@@ -7,6 +7,7 @@ package mr
 //
 
 import (
+	"errors"
 	"os"
 	"strconv"
 )
@@ -22,7 +23,8 @@ import (
    2. 还会用 Job_assigned 返回给 worker 分配的任务名字
 	  2a) 如果 worker 是初次连接、断线重连、之前没有任务、刚刚完成其他任务的情况，会分配新的任务
 	  2b) 如果没有任务分配，那么就设置为 "<NOJOB>"
-	  3c) 如果 worker 任务还在进行中，那么这个参数就保持为正在进行中的任务名字
+	  2c) 如果 worker 任务还在进行中，那么这个参数就保持为正在进行中的任务名字
+	3. Job_files 含有任务所需的文件列表，而 Phase 会告诉 worker 应该是用 map 还是 reduce 函数
 */
 
 // Add your RPC definitions here.
@@ -33,8 +35,10 @@ type HeartbeatArgs struct {
 }
 
 type HeartbeatReply struct {
-	Cid          string
-	Job_assigned string
+	Cid          string   // 分配的 Cid
+	Job_assigned string   // 分配的任务 id
+	Job_files    []string // 任务对应的文件列表，对于 map 任务就只有一个文件；reduce 任务可能有多个
+	Phase        string   // map / reduce
 }
 
 const nojob string = "<NOJOB>"
@@ -63,6 +67,20 @@ func validate_heartbeat_args(args *HeartbeatArgs) bool {
 			}
 		}
 	}
+}
+
+func validate_heartbeat_reply(reply *HeartbeatReply) error {
+	if reply.Cid == "0" {
+		return errors.New("Master didn't assign a valid cid")
+	}
+	if reply.Phase != "map" && reply.Phase != "reduce" {
+		return errors.New("Master returned an invalid phase: " + reply.Phase)
+	}
+	return nil
+}
+
+func name_intermediate_file(mapjob string, reducejob string) string {
+	return "mr-" + mapjob + "-" + reducejob
 }
 
 // Cook up a unique-ish UNIX-domain socket name
