@@ -42,7 +42,6 @@
 	  - worker 还维护类似的 concurrent 字段，每次运行 job 时 ++，结束时 --；但严格要求其小于 2。
 	    故此，一个 worker 确实只能同时运行一个任务
 	  - 由于 concurrent 和 parallelism 变量一个是 worker 独有，一个是多个 workers 共享，故此共享的 parallelism 变量单独使用一个自己的锁来控制并发，而不使用 worker 的锁
-	  - 【TODO】
    
    我的实现中：
       - worker 没有自己的结构体，也不会启动 rpc service，而是就是一个函数进程在运行
@@ -64,6 +63,7 @@
 8. master.stopRPCServer 关闭 RPC server 的方式很有趣
       - 是给自己的 (而非 worker 的) ShutDown RPC 接口发送一个请求
       - 目的是为了避免 master 主线程和 RPC 线程之间的 race condition
+	    后面我们会看到，该函数是在一个协程中被调用的，而不是在主线程中
 	  - 在对 ShutDown RPC 的处理中，会关闭 master.shutdown channel 并关闭对 rpc server 的 listener
    
 
@@ -168,8 +168,21 @@
 	  - 更重要的是，master 还会发起广播通知 master.newCond.Broadcast()，有什么用？下面马上揭晓
 	  
    master.forwardRegistrations
-      - 初始化 workers 个数 i := 0
-	  - 进入无尽循环，每次循环开始首先会上锁，然后检查 master.workers 中的 workers 个数是否等于 i
+```
+	i := 0
+	for {
+		mr.Lock()
+		if len(mr.workers) > i {     // 注意，每次 for loop 只会把一个 worker 加入 channel
+			w := mr.workers[i]       // 下次 loop 会再次上锁，并重新对比 workers 和 i
+			go func() { ch <- w }()  // 使用协程进行入 channel 操作，以避免阻塞！！！！
+			i = i + 1
+		} else {
+			mr.newCond.Wait()        // 等待新注册 workers 的到来
+		}
+		mr.Unlock()
+	}
+```
+	  - 无尽循环，每次循环开始首先会上锁，然后检查 master.workers 中的 workers 个数是否等于 i
 	  - 如果实际的 workers 个数超过 i，那么
 	     + 会陆续的把 workers 的地址通过协程发送到 channel ch 中
 		 + 更新 i 值，最终达到 workers 的个数等于 i，此时所有 workers 的地址都已经发到 ch 中了
@@ -178,11 +191,75 @@
 		 + 一旦 master.Register 接口被调用，workers 增加数量，并广播信号，上面代码的 Wait 就被激活
 		 + Wait 被激活后，会重新上锁，然后完成这个分支的运行，回到开头进行下一轮循环
    总之，该函数会一直阻塞，直到有新的 worker 发起 Register，然后把该 worker 发送到 ch，继续阻塞
+   这个函数实现比较巧妙，非常值得学习
    
    那么，最后问题是，这个接收 workers 地址的 channel 有什么用？那么就是下面的 #14. 中要讨论的
    
    
-14. Master 的核心逻辑：任务调度 schedule() 函数   
+14. Master 的核心逻辑：任务调度 schedule(jobName, mapFiles, nReduce, phase, registerChan) 函数   
+      - 该函数的 registerChan 参数就是 #13. 中新 worker 地址被加入的那个 channel
+	  - 其他的参数用于构建 DoTask 接口的请求参数
+	  - 该函数还会维护 tasks & success 两个新的 channel，前者为待处理任务，后者为处理成功的任务
+	  
+      - 首先创建 tasks channel，把全部任务 id 入 channel (map 的话就是文件数，reduce 就是 nReduce)
+      - 然后创建 success channel，并记录成功任务数为 successTasks := 0
+	  - 核心代码如下
+```
+loop:
+	for {
+		select {
+		case task := <-tasks: 
+			go func() {
+				worker := <-registerChan
+				status := call(worker, "Worker.DoTask", constructTaskArgs(phase, task), nil)
+				if status {
+					success <- 1
+					go func() { registerChan <- worker }()
+				} else {
+					tasks <- task
+				}
+			}()
+		case <-success:                       // 有成功的任务，那么计数 ++
+			successTasks += 1
+		default:
+			if successTasks == ntasks {       // 如果全部任务结束，那么退出 for loop
+				break loop
+			}
+		}
+	}
+```
+      - 最重心的部分显然是第一个 case，也就是如果有待处理的任务时的处理
+	     + 此时会启动一个新的协程，等待空闲 worker 以处理这个任务
+		   为什么要启动协程？因为如果 workers 比较少，那么 <-registerChan 这个操作会阻塞
+		 + 一旦有了空闲 worker，那么调用该 worker 的 DoTask 接口运行任务，并等待运行结果
+		    * 如果任务成功，那么向 success channel 加入新消息，同时把 worker 放回 registerChan
+			* 否则，一旦任务失败，把任务 id 重新放回 tasks channel，以便重新调度
+
+   注意，这里有个问题：
+      - 如果任务失败，对应 worker 不会被重新放回 registerChan 中，就是说不会再被视为空闲 worker
+      - 这里面就有个内在逻辑：如果 DoTask 接口调用失败，那么 master 就认为该 worker 已经挂掉
+	  - master 不会再给这个 worker 分配任务，这个 worker 如果还想接受任务，那么必须重新 register
+	  - master.workers 是一个数组，故此，如果重新注册，那么 workers 中会有多个该 worker 的地址
+	    在 master.killWorkers 的时候，也会被重复关闭，这也是一个隐患，因为会返回完成的任务个数
+	  - worker 的实现中，可以遵循这个约定，一旦失败，那么就 log.Fatal 挂掉，可以保证逻辑一致
+	    但是，其实还有问题，如果这个 worker 之前运行过一些任务，那么如果挂掉了，这些任务数就丢了
+      - 总之，这里会有一些微妙的 bug，不如我的实现效果好
+	  
+
+15. 该实现的一些缺陷
+      - 由于没有实现 Heartbeat 接口，故此没有处理 10 秒无连接就认为挂掉的逻辑
+	  - workers 是有状态的，要维护自己运行的任务数，那么一旦挂掉，master 会丢失信息
+	  - 和上面这条联动，master 维护的信息过少，故此无法进行一些数据完整性的维护工作
+	  - 实现中使用了很多的 channels，这要求启动很多的协程，以避免工作线程阻塞；
+	    好处是省去很多状态相关的遍历，这也进一步使得 master 没有维护很多状态和信息
+   
+   
+   
+   
+   
+   
+   
+   
    
    
    
