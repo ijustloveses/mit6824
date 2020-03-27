@@ -58,6 +58,8 @@
 	  
    我的实现中：
       目前 worker 本身不会退出，会一直尝试连接 master，直到手动关闭进程
+	  (但是，如果想要通过 test-mr.sh 的测试，需要把代码中的 log.Println 换为 log.Panicln
+	   也即如果遇到错误或者无法连接 master 时要退出，而不能一直重连，否则 test cases 就测不完了)
    
 
 8. master.stopRPCServer 关闭 RPC server 的方式很有趣
